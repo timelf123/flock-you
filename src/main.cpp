@@ -27,79 +27,19 @@
 #include <stdio.h>
 #include <stdint.h>
 #include "esp_wifi.h"
-
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
-
-#define BUZZER_PIN 3
-
-// Audio
-#define LOW_FREQ 200
-#define HIGH_FREQ 800
-#define DETECT_FREQ 1000
-#define HEARTBEAT_FREQ 600
-#define BOOT_BEEP_DURATION 300
-#define DETECT_BEEP_DURATION 150
-#define HEARTBEAT_DURATION 100
+#include "fy_board.h"
+#include "fy_types.h"
+#include "fy_patterns.h"
+#include "fy_shared.h"
+#include "fy_audio.h"
+#include "fy_display.h"
+#ifdef FY_HAS_DISPLAY
+#include "fy_display_hw.h"
+#endif
 
 // BLE scanning (mutable — companion mode increases scan duty cycle)
 static int fyBleScanDuration = 2;              // seconds per scan
 static unsigned long fyBleScanInterval = 3000; // ms between scans
-
-// Detection storage
-#define MAX_DETECTIONS 200
-
-// WiFi AP credentials
-#define FY_AP_SSID "flockyou"
-#define FY_AP_PASS "flockyou123"
-
-// ============================================================================
-// DETECTION PATTERNS
-// ============================================================================
-
-// MAC address prefixes (OUIs)
-
-// Flock Safety — high-confidence OUIs (direct registration or exclusive use)
-static const char* flock_mac_prefixes[] = {
-    // FS Ext Battery devices
-    "58:8e:81", "cc:cc:cc", "ec:1b:bd", "90:35:ea", "04:0d:84",
-    "f0:82:c0", "1c:34:f1", "38:5b:44", "94:34:69", "b4:e3:f9",
-    // Flock WiFi devices
-    "70:c9:4e", "3c:91:80", "d8:f3:bc", "80:30:49", "14:5a:fc",
-    "74:4c:a1", "08:3a:88", "9c:2f:9d", "94:08:53", "e4:aa:ea",
-    // Flock Safety (direct IEEE registration)
-    "b4:1e:52"
-};
-
-// Flock Safety contract manufacturers — lower confidence alone.
-// These OUIs belong to Liteon Technology and USI (Universal Scientific
-// Industrial), which produce Flock hardware but also ship unrelated
-// consumer/enterprise devices. MAC match alone may be a false positive.
-static const char* flock_mfr_mac_prefixes[] = {
-    "f4:6a:dd", "f8:a2:d6", "e0:0a:f6", "00:f4:8d", "d0:39:57",
-    "e8:d0:fc"
-};
-
-// SoundThinking (formerly ShotSpotter) — acoustic gunshot detection sensors.
-// d4:11:d6 is registered to SoundThinking in the IEEE OUI database.
-static const char* soundthinking_mac_prefixes[] = {
-    "d4:11:d6"
-};
-
-// BLE device name patterns (matched case-insensitive substring)
-static const char* device_name_patterns[] = {
-    "FS Ext Battery",
-    "Penguin",
-    "Flock",
-    "Pigvision"
-};
-
-// BLE Manufacturer Company IDs
-// Source: wgreenberg/flock-you - XUNTONG ID associated with Flock Safety devices
-static const uint16_t ble_manufacturer_ids[] = {
-    0x09C8   // XUNTONG
-};
 
 // ============================================================================
 // RAVEN SURVEILLANCE DEVICE UUID PATTERNS
@@ -114,53 +54,24 @@ static const uint16_t ble_manufacturer_ids[] = {
 #define RAVEN_OLD_HEALTH_SERVICE    "00001809-0000-1000-8000-00805f9b34fb"
 #define RAVEN_OLD_LOCATION_SERVICE  "00001819-0000-1000-8000-00805f9b34fb"
 
-static const char* raven_service_uuids[] = {
-    RAVEN_DEVICE_INFO_SERVICE,
-    RAVEN_GPS_SERVICE,
-    RAVEN_POWER_SERVICE,
-    RAVEN_NETWORK_SERVICE,
-    RAVEN_UPLOAD_SERVICE,
-    RAVEN_ERROR_SERVICE,
-    RAVEN_OLD_HEALTH_SERVICE,
-    RAVEN_OLD_LOCATION_SERVICE
-};
-
 // ============================================================================
 // DETECTION STORAGE
 // ============================================================================
 
-struct FYDetection {
-    char mac[18];
-    char name[48];
-    int rssi;
-    char method[32];
-    unsigned long firstSeen;
-    unsigned long lastSeen;
-    int count;
-    bool isRaven;
-    char ravenFW[16];
-    // GPS from phone (wardriving)
-    double gpsLat;
-    double gpsLon;
-    float gpsAcc;
-    bool hasGPS;
-};
-
-static FYDetection fyDet[MAX_DETECTIONS];
-static int fyDetCount = 0;
-static SemaphoreHandle_t fyMutex = NULL;
+FYDetection fyDet[FY_MAX_DETECTIONS];
+int fyDetCount = 0;
+SemaphoreHandle_t fyMutex = NULL;
 
 // ============================================================================
 // GLOBALS
 // ============================================================================
 
-static bool fyBuzzerOn = true;
 static unsigned long fyLastBleScan = 0;
-static bool fyTriggered = false;
-static bool fyDeviceInRange = false;
+bool fyTriggered = false;
+bool fyDeviceInRange = false;
 static unsigned long fyLastDetTime = 0;
 static unsigned long fyLastHB = 0;
-static NimBLEScan* fyBLEScan = NULL;
+NimBLEScan* fyBLEScan = NULL;
 static AsyncWebServer fyServer(80);
 
 // BLE GATT server (DeFlock app connectivity)
@@ -181,113 +92,37 @@ static unsigned long         fyLastSerialHeartbeat = 0;
 static volatile bool         fyCompanionChangePending = false;
 
 // Phone GPS state (updated via browser Geolocation API -> /api/gps)
-static double fyGPSLat = 0;
-static double fyGPSLon = 0;
-static float  fyGPSAcc = 0;
-static bool   fyGPSValid = false;
-static unsigned long fyGPSLastUpdate = 0;
-#define GPS_STALE_MS 30000  // GPS considered stale after 30s without update
+double fyGPSLat = 0;
+double fyGPSLon = 0;
+float fyGPSAcc = 0;
+bool fyGPSValid = false;
+unsigned long fyGPSLastUpdate = 0;
 
-// Session persistence (SPIFFS)
-#define FY_SESSION_FILE  "/session.json"
-#define FY_PREV_FILE     "/prev_session.json"
-#define FY_SAVE_INTERVAL 15000  // Auto-save every 15 seconds (prevent data loss on quick power-cycle)
+#define FY_SAVE_INTERVAL 15000
 static unsigned long fyLastSave = 0;
-static int fyLastSaveCount = 0;  // Track changes to avoid unnecessary writes
-static bool fySpiffsReady = false;
-
-// ============================================================================
-// AUDIO SYSTEM
-// ============================================================================
-
-static void fyBeep(int freq, int dur) {
-    if (!fyBuzzerOn) return;
-    tone(BUZZER_PIN, freq, dur);
-    delay(dur + 50);
-}
-
-// Crow caw: harsh descending sweep with warble texture
-static void fyCaw(int startFreq, int endFreq, int durationMs, int warbleHz) {
-    if (!fyBuzzerOn) return;
-    int steps = durationMs / 8;  // 8ms per step
-    float fStep = (float)(endFreq - startFreq) / steps;
-    for (int i = 0; i < steps; i++) {
-        int f = startFreq + (int)(fStep * i);
-        // Add warble: oscillate frequency +/- for raspy texture
-        if (warbleHz > 0 && (i % 3 == 0)) {
-            f += ((i % 6 < 3) ? warbleHz : -warbleHz);
-        }
-        if (f < 100) f = 100;
-        tone(BUZZER_PIN, f, 10);
-        delay(8);
-    }
-    noTone(BUZZER_PIN);
-}
-
-static void fyBootBeep() {
-    printf("[FLOCK-YOU] Boot sound (buzzer %s)\n", fyBuzzerOn ? "ON" : "OFF");
-    if (!fyBuzzerOn) return;
-
-    // === CROW CALL SEQUENCE ===
-    // Caw 1: sharp descending caw
-    fyCaw(850, 380, 180, 40);
-    delay(100);
-
-    // Caw 2: slightly lower, shorter
-    fyCaw(780, 350, 150, 50);
-    delay(100);
-
-    // Caw 3: longer trailing caw with more rasp
-    fyCaw(820, 280, 220, 60);
-    delay(80);
-
-    // Quick staccato ending "kk-kk"
-    tone(BUZZER_PIN, 600, 25); delay(40);
-    tone(BUZZER_PIN, 550, 25); delay(40);
-    noTone(BUZZER_PIN);
-
-    printf("[FLOCK-YOU] *caw caw caw*\n");
-}
-
-static void fyDetectBeep() {
-    printf("[FLOCK-YOU] Detection alert!\n");
-    if (!fyBuzzerOn) return;
-    // Alarm crow: two sharp ascending chirps then a caw
-    fyCaw(400, 900, 100, 30);   // rising alarm chirp
-    delay(60);
-    fyCaw(450, 950, 100, 30);   // second chirp, higher
-    delay(60);
-    fyCaw(900, 350, 200, 50);   // descending caw
-}
-
-static void fyHeartbeat() {
-    if (!fyBuzzerOn) return;
-    // Soft double coo - like a distant crow
-    fyCaw(500, 400, 80, 20);
-    delay(120);
-    fyCaw(480, 380, 80, 20);
-}
+static int fyLastSaveCount = 0;
+bool fySpiffsReady = false;
 
 // ============================================================================
 // DETECTION HELPERS
 // ============================================================================
 
 static bool checkFlockMAC(const char* mac_str) {
-    for (size_t i = 0; i < sizeof(flock_mac_prefixes)/sizeof(flock_mac_prefixes[0]); i++) {
+    for (size_t i = 0; i < flock_mac_prefixes_count; i++) {
         if (strncasecmp(mac_str, flock_mac_prefixes[i], 8) == 0) return true;
     }
     return false;
 }
 
 static bool checkFlockMfrMAC(const char* mac_str) {
-    for (size_t i = 0; i < sizeof(flock_mfr_mac_prefixes)/sizeof(flock_mfr_mac_prefixes[0]); i++) {
+    for (size_t i = 0; i < flock_mfr_mac_prefixes_count; i++) {
         if (strncasecmp(mac_str, flock_mfr_mac_prefixes[i], 8) == 0) return true;
     }
     return false;
 }
 
 static bool checkSoundThinkingMAC(const char* mac_str) {
-    for (size_t i = 0; i < sizeof(soundthinking_mac_prefixes)/sizeof(soundthinking_mac_prefixes[0]); i++) {
+    for (size_t i = 0; i < soundthinking_mac_prefixes_count; i++) {
         if (strncasecmp(mac_str, soundthinking_mac_prefixes[i], 8) == 0) return true;
     }
     return false;
@@ -295,14 +130,14 @@ static bool checkSoundThinkingMAC(const char* mac_str) {
 
 static bool checkDeviceName(const char* name) {
     if (!name || !name[0]) return false;
-    for (size_t i = 0; i < sizeof(device_name_patterns)/sizeof(device_name_patterns[0]); i++) {
+    for (size_t i = 0; i < device_name_patterns_count; i++) {
         if (strcasestr(name, device_name_patterns[i])) return true;
     }
     return false;
 }
 
 static bool checkManufacturerID(uint16_t id) {
-    for (size_t i = 0; i < sizeof(ble_manufacturer_ids)/sizeof(ble_manufacturer_ids[0]); i++) {
+    for (size_t i = 0; i < ble_manufacturer_ids_count; i++) {
         if (ble_manufacturer_ids[i] == id) return true;
     }
     return false;
@@ -319,7 +154,7 @@ static bool checkRavenUUID(NimBLEAdvertisedDevice* device, char* out_uuid = null
     for (int i = 0; i < count; i++) {
         NimBLEUUID svc = device->getServiceUUID(i);
         std::string str = svc.toString();
-        for (size_t j = 0; j < sizeof(raven_service_uuids)/sizeof(raven_service_uuids[0]); j++) {
+        for (size_t j = 0; j < raven_service_uuids_count; j++) {
             if (strcasecmp(str.c_str(), raven_service_uuids[j]) == 0) {
                 if (out_uuid) strncpy(out_uuid, str.c_str(), 40);
                 return true;
@@ -348,10 +183,6 @@ static const char* estimateRavenFW(NimBLEAdvertisedDevice* device) {
 // ============================================================================
 // GPS HELPERS
 // ============================================================================
-
-static bool fyGPSIsFresh() {
-    return fyGPSValid && (millis() - fyGPSLastUpdate < GPS_STALE_MS);
-}
 
 static void fyAttachGPS(FYDetection& d) {
     if (fyGPSIsFresh()) {
@@ -388,7 +219,7 @@ static int fyAddDetection(const char* mac, const char* name, int rssi,
     }
 
     // Add new
-    if (fyDetCount < MAX_DETECTIONS) {
+    if (fyDetCount < FY_MAX_DETECTIONS) {
         FYDetection& d = fyDet[fyDetCount];
         memset(&d, 0, sizeof(d));
         strncpy(d.mac, mac, sizeof(d.mac) - 1);
@@ -584,6 +415,15 @@ class FYBLECallbacks : public NimBLEAdvertisedDeviceCallbacks {
                 fySendBLE(jsonBuf, jsonLen + 1);
             }
 
+            if (idx >= 0) {
+                bool isNew = false;
+                if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    isNew = (fyDet[idx].count == 1);
+                    xSemaphoreGive(fyMutex);
+                }
+                if (isNew) fyUiNotifyNewDetection();
+            }
+
             if (!fyTriggered && highConfidence) {
                 fyTriggered = true;
                 fyDetectBeep();
@@ -629,7 +469,7 @@ static void writeDetectionsJSON(AsyncResponseStream *resp) {
 // SESSION PERSISTENCE (SPIFFS)
 // ============================================================================
 
-static void fySaveSession() {
+void fySaveSession() {
     if (!fySpiffsReady || !fyMutex) return;
     if (xSemaphoreTake(fyMutex, pdMS_TO_TICKS(300)) != pdTRUE) return;
 
@@ -910,32 +750,32 @@ static void fySetupServer() {
     fyServer.on("/api/patterns", HTTP_GET, [](AsyncWebServerRequest *r) {
         AsyncResponseStream *resp = r->beginResponseStream("application/json");
         resp->print("{\"macs\":[");
-        for (size_t i = 0; i < sizeof(flock_mac_prefixes)/sizeof(flock_mac_prefixes[0]); i++) {
+        for (size_t i = 0; i < flock_mac_prefixes_count; i++) {
             if (i > 0) resp->print(",");
             resp->printf("\"%s\"", flock_mac_prefixes[i]);
         }
         resp->print("],\"macs_mfr\":[");
-        for (size_t i = 0; i < sizeof(flock_mfr_mac_prefixes)/sizeof(flock_mfr_mac_prefixes[0]); i++) {
+        for (size_t i = 0; i < flock_mfr_mac_prefixes_count; i++) {
             if (i > 0) resp->print(",");
             resp->printf("\"%s\"", flock_mfr_mac_prefixes[i]);
         }
         resp->print("],\"macs_soundthinking\":[");
-        for (size_t i = 0; i < sizeof(soundthinking_mac_prefixes)/sizeof(soundthinking_mac_prefixes[0]); i++) {
+        for (size_t i = 0; i < soundthinking_mac_prefixes_count; i++) {
             if (i > 0) resp->print(",");
             resp->printf("\"%s\"", soundthinking_mac_prefixes[i]);
         }
         resp->print("],\"names\":[");
-        for (size_t i = 0; i < sizeof(device_name_patterns)/sizeof(device_name_patterns[0]); i++) {
+        for (size_t i = 0; i < device_name_patterns_count; i++) {
             if (i > 0) resp->print(",");
             resp->printf("\"%s\"", device_name_patterns[i]);
         }
         resp->print("],\"mfr\":[");
-        for (size_t i = 0; i < sizeof(ble_manufacturer_ids)/sizeof(ble_manufacturer_ids[0]); i++) {
+        for (size_t i = 0; i < ble_manufacturer_ids_count; i++) {
             if (i > 0) resp->print(",");
             resp->printf("%u", ble_manufacturer_ids[i]);
         }
         resp->print("],\"raven\":[");
-        for (size_t i = 0; i < sizeof(raven_service_uuids)/sizeof(raven_service_uuids[0]); i++) {
+        for (size_t i = 0; i < raven_service_uuids_count; i++) {
             if (i > 0) resp->print(",");
             resp->printf("\"%s\"", raven_service_uuids[i]);
         }
@@ -1087,12 +927,7 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
-    // Standalone mode: buzzer always on by default
-    fyBuzzerOn = true;
-
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
-
+    fyAudioInit();
     fyMutex = xSemaphoreCreateMutex();
 
     // Init SPIFFS for session persistence
@@ -1107,8 +942,22 @@ void setup() {
 
     printf("\n========================================\n");
     printf("  FLOCK-YOU Surveillance Detector\n");
-    printf("  Buzzer: %s\n", fyBuzzerOn ? "ON" : "OFF");
+    printf("  Audio: %s\n", fyAudioIsMuted() ? "MUTED" : "ON");
     printf("========================================\n");
+
+    // WiFi AP before display/LVGL — needs internal RAM for NVS/WiFi stacks
+    WiFi.mode(WIFI_AP);
+    delay(100);
+    if (!WiFi.softAP(FY_AP_SSID, FY_AP_PASS)) {
+        printf("[FLOCK-YOU] WARNING: softAP start failed\n");
+    }
+    printf("[FLOCK-YOU] AP: %s / %s\n", FY_AP_SSID, FY_AP_PASS);
+    printf("[FLOCK-YOU] IP: %s\n", WiFi.softAPIP().toString().c_str());
+    fySetupServer();
+#if defined(BOARD_HAS_PSRAM)
+    printf("[FLOCK-YOU] Heap internal=%u psram=%u\n",
+           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+#endif
 
     // Init BLE with device name and large MTU for GATT notifications
     NimBLEDevice::init("flockyou");
@@ -1143,18 +992,14 @@ void setup() {
     pAdv->start();
     printf("[FLOCK-YOU] BLE GATT server advertising (service %s)\n", FY_SERVICE_UUID);
 
-    // Crow calls play WHILE BLE is already scanning
     fyBootBeep();
 
-    // Start WiFi AP (no need to connect to anything -- AP only)
-    WiFi.mode(WIFI_AP);
-    delay(100);
-    WiFi.softAP(FY_AP_SSID, FY_AP_PASS);
-    printf("[FLOCK-YOU] AP: %s / %s\n", FY_AP_SSID, FY_AP_PASS);
-    printf("[FLOCK-YOU] IP: %s\n", WiFi.softAPIP().toString().c_str());
-
-    // Start web dashboard
-    fySetupServer();
+#ifdef FY_HAS_DISPLAY
+    if (!fyDisplayHwInit()) {
+        printf("[FLOCK-YOU] WARNING: LCD hardware init failed\n");
+    }
+    fyDisplayInit();
+#endif
 
     printf("[FLOCK-YOU] Detection methods: MAC prefix, device name, manufacturer ID, Raven UUID\n");
     printf("[FLOCK-YOU] Dashboard: http://192.168.4.1\n");
@@ -1219,5 +1064,9 @@ void loop() {
         fyLastSave = millis();
     }
 
+#ifdef FY_HAS_DISPLAY
+    fyUiTick();
+#else
     delay(100);
+#endif
 }

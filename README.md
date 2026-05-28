@@ -64,12 +64,30 @@ After relaunching, connect to the `flockyou` AP, open `192.168.4.1`, and tap the
 
 ## Hardware
 
-**Board:** Seeed Studio XIAO ESP32-S3
+### Headless (default): Seeed XIAO ESP32-C3
 
 | Pin | Function |
 |-----|----------|
 | GPIO 3 | Piezo buzzer |
-| GPIO 21 | LED (optional) |
+
+### Screened: LCDWiki 2.8" ESP32-S3 E32N28P / E32C28P
+
+[LCDWiki E32C28P/E32N28P](https://www.lcdwiki.com/2.8inch_ESP32-S3_Display_E32C28P/E32N28P) — **ILI9341** 240×320, **not** the Waveshare ST7789 pinout.
+
+| SKU | Touch | PlatformIO env |
+|-----|-------|----------------|
+| **E32C28P** / **E32N28P** | FT6336G (I2C 0x38) | `esp32_s3_lcdwiki_e32n28p` |
+
+| Subsystem | GPIO |
+|-----------|------|
+| LCD SPI | CS 10, DC 46, MOSI 11, SCLK 12, MISO 13, BL 45 |
+| Touch (C28P only) | SDA 16, SCL 15, RST 18, INT 17 |
+| Audio I2S | EN 1 (low=on), MCLK 4, BCLK 5, DOUT 6, LRCK 7 |
+| RGB status LED (back) | 42 |
+
+**Waveshare** ESP32-S3-Touch-LCD-2.8 (ST7789) uses env `esp32_s3_waveshare_lcd_28` instead.
+
+The screened build still runs the WiFi AP and web dashboard; use the phone for GPS wardriving and JSON/CSV/KML export. The LCD mirrors the web UI (LIVE / PREV / DB / TOOLS tabs).
 
 ---
 
@@ -77,12 +95,23 @@ After relaunching, connect to the `flockyou` AP, open `192.168.4.1`, and tap the
 
 Requires [PlatformIO](https://platformio.org/).
 
+**XIAO ESP32-C3 (headless):**
+
 ```bash
-cd flock-you
-pio run                     # build
-pio run -t upload           # flash
-pio device monitor          # serial output
+pio run -e xiao_esp32c3
+pio run -e xiao_esp32c3 -t upload
+pio device monitor
 ```
+
+**LCDWiki 2.8" ESP32-S3 (ILI9341 + FT6336 touch):**
+
+```bash
+pio run -e esp32_s3_lcdwiki_e32n28p
+pio run -e esp32_s3_lcdwiki_e32n28p -t upload
+pio device monitor
+```
+
+If touches are offset, adjust `FY_TOUCH_SWAP_XY` / `FY_TOUCH_MIRROR_X` / `FY_TOUCH_MIRROR_Y` in `include/fy_board.h`. ES3**N**28P boards ship without a touch panel — I2C scan will show no device at `0x38`.
 
 **Dependencies** (managed by PlatformIO):
 
@@ -90,6 +119,7 @@ pio device monitor          # serial output
 - `ESP Async WebServer` + `AsyncTCP` — web dashboard
 - `ArduinoJson` — JSON serialization
 - `SPIFFS` — session persistence to flash
+- `LVGL` + `TFT_eSPI` — on-device UI (screened env only)
 
 ---
 
