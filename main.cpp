@@ -1,9 +1,11 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include "esp_https_server.h"
 #include <ctype.h>
 #include <string.h>
 #include <SPIFFS.h>
+#include "fy_ap_cert.h"
 
 // ============================================================
 // CONFIG
@@ -76,6 +78,11 @@ static const size_t SSID_KEYWORD_COUNT = sizeof(target_ssid_keywords) / sizeof(t
 #define FY_SESSION_TMP       "/session.tmp"
 #define FY_PREV_FILE         "/prev_session.json"
 #define AUTOSAVE_INTERVAL_MS 60000
+
+// HTTPS AP dashboard (optional companion UI while sniffing)
+#define FY_AP_SSID "flockyou"
+#define FY_AP_PASS "flockyou123"
+#define FY_AP_CHANNEL 1
 
 // ============================================================
 // TARGET OUI LIST  (all lowercase, colons only)
@@ -212,6 +219,7 @@ static volatile unsigned long ledOffAt = 0;
 // HB_DEVICE_ACTIVE_MS the heartbeat stops until the next new detection.
 static unsigned long fyLastTargetSeen  = 0;
 static unsigned long fyLastHeartbeatAt = 0;
+static httpd_handle_t fyHttpsServer = nullptr;
 
 // ============================================================
 // 802.11 HEADER
@@ -420,6 +428,9 @@ static void applyInitialChannel() {
 
 static void updateChannelMode() {
   if (sniffingStopped) return;
+  // Keep AP clients stable: once a phone is connected to the dashboard,
+  // pin channel instead of hopping.
+  if (WiFi.softAPgetStationNum() > 0) return;
 #if CHANNEL_MODE == CHANNEL_MODE_SINGLE
   if (currentChannel != SINGLE_CHANNEL) {
     currentChannel = SINGLE_CHANNEL;
@@ -1039,6 +1050,132 @@ static void heartbeatTick() {
 }
 
 // ============================================================
+// HTTPS DASHBOARD (LIVE / PREV / DB)
+// ============================================================
+
+static String fyBuildDetectionsJSON() {
+  String out = "[";
+  for (int i = 0; i < fyDetCount; i++) {
+    if (i > 0) out += ",";
+    char ssidEsc[sizeof(fyDet[i].ssid) * 6 + 1];
+    jsonEscape(ssidEsc, sizeof(ssidEsc), fyDet[i].ssid);
+    char row[512];
+    snprintf(row, sizeof(row),
+             "{\"mac\":\"%s\",\"method\":\"%s\",\"rssi\":%d,\"channel\":%u,"
+             "\"first\":%lu,\"last\":%lu,\"count\":%u,\"ssid\":\"%s\"}",
+             fyDet[i].mac, fyDet[i].method, fyDet[i].rssi, (unsigned)fyDet[i].channel,
+             (unsigned long)fyDet[i].firstSeen, (unsigned long)fyDet[i].lastSeen,
+             (unsigned)fyDet[i].count, ssidEsc);
+    out += row;
+  }
+  out += "]";
+  return out;
+}
+
+static String fyLoadEnvelopePayload(const char* path) {
+  if (!fySpiffsReady || !SPIFFS.exists(path)) return "[]";
+  File f = SPIFFS.open(path, "r");
+  if (!f) return "[]";
+  String hdr = f.readStringUntil('\n');
+  (void)hdr;
+  String body = f.readString();
+  f.close();
+  if (body.length() == 0) return "[]";
+  return body;
+}
+
+static String fyBuildPatternsJSON() {
+  String out = "{\"ouis\":[";
+  for (size_t i = 0; i < OUI_COUNT; i++) {
+    if (i > 0) out += ",";
+    out += "\"";
+    out += target_ouis[i];
+    out += "\"";
+  }
+  out += "]}";
+  return out;
+}
+
+static esp_err_t fySendResponse(httpd_req_t* req, const char* status, const char* contentType, const String& body) {
+  httpd_resp_set_status(req, status);
+  httpd_resp_set_type(req, contentType);
+  return httpd_resp_send(req, body.c_str(), body.length());
+}
+
+static esp_err_t fyHandleRoot(httpd_req_t* req) {
+  static const char FY_HTML[] PROGMEM = R"rawliteral(
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FLOCK-YOU</title><style>
+body{font-family:monospace;background:#0a0012;color:#e0e0e0;margin:0}
+.h{padding:10px 14px;border-bottom:1px solid #8b5cf6}.h b{color:#ec4899}
+.t{display:flex}.t button{flex:1;padding:10px;border:0;background:#140728;color:#8b5cf6}.t button.a{color:#ec4899;background:#2d1b69}
+.p{padding:10px}.c{display:none}.c.a{display:block}.d{padding:8px;border:1px solid #8b5cf6;border-radius:6px;margin:6px 0;background:#1a1033}
+.e{opacity:.7}
+</style></head><body>
+<div class="h"><b>FLOCK-YOU</b> promiscuous dashboard</div>
+<div class="t"><button class="a" onclick="tab(0,this)">LIVE</button><button onclick="tab(1,this)">PREV</button><button onclick="tab(2,this)">DB</button></div>
+<div class="p">
+<div id="p0" class="c a"></div>
+<div id="p1" class="c"></div>
+<div id="p2" class="c"></div>
+</div>
+<script>
+let LIVE=[],PREV=[],DB=null;
+function tab(i,el){document.querySelectorAll('.t button').forEach(b=>b.classList.remove('a'));document.querySelectorAll('.c').forEach(c=>c.classList.remove('a'));el.classList.add('a');document.getElementById('p'+i).classList.add('a');if(i===1&&!window._prev)loadPrev();if(i===2&&!window._db)loadDb();}
+function card(d){return '<div class=d><div><b>'+d.mac+'</b> ch'+d.channel+' rssi '+d.rssi+'</div><div class=e>'+d.method+' x'+d.count+(d.ssid?(' ssid:'+d.ssid):'')+'</div></div>';}
+function renderLive(){let el=document.getElementById('p0');if(!LIVE.length){el.innerHTML='<div class=e>No detections yet</div>';return;}LIVE.sort((a,b)=>b.last-a.last);el.innerHTML=LIVE.map(card).join('');}
+function loadLive(){fetch('/api/detections').then(r=>r.json()).then(d=>{LIVE=d;renderLive();}).catch(()=>{});}
+function loadPrev(){fetch('/api/history').then(r=>r.json()).then(d=>{PREV=d;let el=document.getElementById('p1');window._prev=1;if(!PREV.length){el.innerHTML='<div class=e>No prior session data</div>';return;}PREV.sort((a,b)=>b.last-a.last);el.innerHTML=PREV.map(card).join('');}).catch(()=>{document.getElementById('p1').innerHTML='<div class=e>History load failed</div>';});}
+function loadDb(){fetch('/api/patterns').then(r=>r.json()).then(d=>{DB=d;window._db=1;let el=document.getElementById('p2');el.innerHTML='<div>OUI prefixes: '+d.ouis.length+'</div><div class=e style=\"margin-top:8px\">'+d.ouis.join('<br>')+'</div>';}).catch(()=>{document.getElementById('p2').innerHTML='<div class=e>Pattern DB load failed</div>';});}
+loadLive();setInterval(loadLive,2500);
+</script></body></html>
+)rawliteral";
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, FY_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t fyHandleDetections(httpd_req_t* req) {
+  return fySendResponse(req, "200 OK", "application/json", fyBuildDetectionsJSON());
+}
+
+static esp_err_t fyHandleHistory(httpd_req_t* req) {
+  return fySendResponse(req, "200 OK", "application/json", fyLoadEnvelopePayload(FY_PREV_FILE));
+}
+
+static esp_err_t fyHandlePatterns(httpd_req_t* req) {
+  return fySendResponse(req, "200 OK", "application/json", fyBuildPatternsJSON());
+}
+
+static void fyStartHttpsServer() {
+  if (fyHttpsServer) return;
+  httpd_ssl_config_t cfg = HTTPD_SSL_CONFIG_DEFAULT();
+  cfg.httpd.max_uri_handlers = 8;
+  cfg.httpd.max_resp_headers = 4;
+  cfg.httpd.max_open_sockets = 2;
+  cfg.httpd.backlog_conn = 2;
+  cfg.httpd.stack_size = 6144;
+  cfg.transport_mode = HTTPD_SSL_TRANSPORT_SECURE;
+  cfg.port_secure = 443;
+  cfg.cacert_pem = (const uint8_t*)FY_AP_TLS_CERT_PEM;
+  cfg.cacert_len = FY_AP_TLS_CERT_PEM_len;
+  cfg.prvtkey_pem = (const uint8_t*)FY_AP_TLS_KEY_PEM;
+  cfg.prvtkey_len = FY_AP_TLS_KEY_PEM_len;
+  if (httpd_ssl_start(&fyHttpsServer, &cfg) != ESP_OK) {
+    fyHttpsServer = nullptr;
+    dualPrintln("[flockyou] HTTPS start failed");
+    return;
+  }
+  static const httpd_uri_t routes[] = {
+    {.uri="/", .method=HTTP_GET, .handler=fyHandleRoot, .user_ctx=nullptr},
+    {.uri="/api/detections", .method=HTTP_GET, .handler=fyHandleDetections, .user_ctx=nullptr},
+    {.uri="/api/history", .method=HTTP_GET, .handler=fyHandleHistory, .user_ctx=nullptr},
+    {.uri="/api/patterns", .method=HTTP_GET, .handler=fyHandlePatterns, .user_ctx=nullptr},
+  };
+  for (size_t i = 0; i < sizeof(routes)/sizeof(routes[0]); i++) httpd_register_uri_handler(fyHttpsServer, &routes[i]);
+  dualPrintln("[flockyou] HTTPS dashboard started on 443");
+}
+
+// ============================================================
 // SETUP / LOOP
 // ============================================================
 
@@ -1080,14 +1217,13 @@ void setup() {
     dualPrintln("[flockyou] SPIFFS init FAILED — running without persistence");
   }
 
-  WiFi.mode(WIFI_MODE_NULL);
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  esp_wifi_init(&cfg);
-  esp_wifi_set_storage(WIFI_STORAGE_RAM);
-  esp_wifi_set_mode(WIFI_MODE_NULL);
-  esp_wifi_start();
-
-  applyInitialChannel();
+  // AP + promiscuous sniffing: AP starts on a stable channel so mobile
+  // clients can connect; hopping is paused while clients are attached.
+  currentChannel = FY_AP_CHANNEL;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(FY_AP_SSID, FY_AP_PASS, currentChannel, false, 4);
+  lastHop = millis();
+  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
 
   wifi_promiscuous_filter_t filt = {
     .filter_mask = 0
@@ -1101,11 +1237,15 @@ void setup() {
   esp_wifi_set_promiscuous_filter(&filt);
   esp_wifi_set_promiscuous_rx_cb(&wifiSniffer);
   esp_wifi_set_promiscuous(true);
+  fyStartHttpsServer();
 
   dualPrintln("[flockyou] merged WiFi detector started");
   dualPrintf("[flockyou] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
                 channelModeName(), CHANNEL_DWELL_MS, currentChannel,
                 RSSI_MIN, fySpiffsReady ? 1 : 0);
+  dualPrintf("[flockyou] AP %s / %s @ %s\n",
+             FY_AP_SSID, FY_AP_PASS, WiFi.softAPIP().toString().c_str());
+  dualPrintln("[flockyou] dashboard: https://192.168.4.1");
 
   lastHeartbeat = millis();
   fyLastSaveAt  = millis();
