@@ -20,19 +20,21 @@
 #include <NimBLEAdvertisedDevice.h>
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "esp_wifi.h"
+#include "esp_bt.h"
+#include "esp_https_server.h"
 #include "fy_board.h"
 #include "fy_types.h"
 #include "fy_patterns.h"
 #include "fy_shared.h"
 #include "fy_audio.h"
 #include "fy_display.h"
+#include "fy_ap_cert.h"
 #ifdef FY_HAS_DISPLAY
 #include "fy_display_hw.h"
 #endif
@@ -72,7 +74,13 @@ bool fyDeviceInRange = false;
 static unsigned long fyLastDetTime = 0;
 static unsigned long fyLastHB = 0;
 NimBLEScan* fyBLEScan = NULL;
-static AsyncWebServer fyServer(80);
+static bool fyBlePausedForApClient = false;
+static bool fyBleStackUp = false;
+static httpd_handle_t fyHttpsServer = NULL;
+static void fyStartHttpsServer();
+static void fyStopHttpsServer();
+static void fyInitBleStack();
+static void fyDeinitBleStack();
 
 // BLE GATT server (DeFlock app connectivity)
 #define FY_SERVICE_UUID     "a1b2c3d4-e5f6-7890-abcd-ef0123456789"
@@ -294,6 +302,7 @@ static void fySendBLE(const char* data, size_t len) {
 static void fyOnCompanionChange() {
     if (fyBLEClientConnected || fySerialHostConnected) {
         // Companion mode — disable WiFi AP, boost BLE scanning
+        fyStopHttpsServer();
         WiFi.softAPdisconnect(true);
         WiFi.mode(WIFI_OFF);
         fyBleScanDuration = 3;
@@ -304,9 +313,27 @@ static void fyOnCompanionChange() {
         WiFi.mode(WIFI_AP);
         delay(100);
         WiFi.softAP(FY_AP_SSID, FY_AP_PASS);
+        fyStartHttpsServer();
         fyBleScanDuration = 2;
         printf("[FLOCK-YOU] Standalone mode: WiFi AP ON (%s), scan duration %ds\n",
                FY_AP_SSID, fyBleScanDuration);
+    }
+}
+
+static void fyUpdateBleForApClients() {
+    if (WiFi.getMode() != WIFI_AP) return;
+    int stations = WiFi.softAPgetStationNum();
+    bool hasApClients = stations > 0;
+
+    if (hasApClients && !fyBlePausedForApClient) {
+        fyDeinitBleStack();
+        fyBlePausedForApClient = true;
+        printf("[FLOCK-YOU] AP client connected (%d) - BLE disabled for HTTPS heap\n", stations);
+    } else if (!hasApClients && fyBlePausedForApClient) {
+        fyBlePausedForApClient = false;
+        fyInitBleStack();
+        fyLastBleScan = 0;
+        printf("[FLOCK-YOU] AP clients gone - BLE re-enabled\n");
     }
 }
 
@@ -437,32 +464,152 @@ class FYBLECallbacks : public NimBLEAdvertisedDeviceCallbacks {
     }
 };
 
+static void fyInitBleStack() {
+    if (fyBleStackUp) return;
+
+    NimBLEDevice::init("flockyou");
+    NimBLEDevice::setMTU(512);
+
+    fyBLEScan = NimBLEDevice::getScan();
+    fyBLEScan->setAdvertisedDeviceCallbacks(new FYBLECallbacks());
+    fyBLEScan->setActiveScan(true);
+    fyBLEScan->setInterval(100);
+    fyBLEScan->setWindow(99);
+
+    fyBLEServer = NimBLEDevice::createServer();
+    fyBLEServer->setCallbacks(new FYServerCallbacks());
+    NimBLEService* pService = fyBLEServer->createService(FY_SERVICE_UUID);
+    fyTxChar = pService->createCharacteristic(
+        FY_TX_CHAR_UUID,
+        NIMBLE_PROPERTY::NOTIFY
+    );
+    pService->start();
+
+    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+    pAdv->addServiceUUID(FY_SERVICE_UUID);
+    pAdv->setName("flockyou");
+    pAdv->setScanResponse(true);
+    pAdv->start();
+
+    fyBleStackUp = true;
+    fyBlePausedForApClient = false;
+    fyLastBleScan = 0;
+    printf("[FLOCK-YOU] BLE stack initialized\n");
+}
+
+static void fyDeinitBleStack() {
+    if (!fyBleStackUp) return;
+    if (fyBLEScan && fyBLEScan->isScanning()) fyBLEScan->stop();
+    NimBLEDevice::stopAdvertising();
+    NimBLEDevice::deinit(true);
+    fyBLEScan = NULL;
+    fyBLEServer = NULL;
+    fyTxChar = NULL;
+    fyBLEClientConnected = false;
+    fyNegotiatedMTU = 23;
+    fyBleStackUp = false;
+    printf("[FLOCK-YOU] BLE stack deinitialized for HTTPS heap\n");
+}
+
 // ============================================================================
 // JSON HELPER
 // ============================================================================
 
-static void writeDetectionsJSON(AsyncResponseStream *resp) {
-    resp->print("[");
+static String fyBuildDetectionsJSON() {
+    String out = "[";
     if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         for (int i = 0; i < fyDetCount; i++) {
-            if (i > 0) resp->print(",");
-            resp->printf(
-                "{\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"method\":\"%s\","
-                "\"first\":%lu,\"last\":%lu,\"count\":%d,"
-                "\"raven\":%s,\"fw\":\"%s\"",
-                fyDet[i].mac, fyDet[i].name, fyDet[i].rssi, fyDet[i].method,
-                fyDet[i].firstSeen, fyDet[i].lastSeen, fyDet[i].count,
-                fyDet[i].isRaven ? "true" : "false", fyDet[i].ravenFW);
-            // Append GPS if present
+            if (i > 0) out += ",";
+            char row[384];
+            snprintf(row, sizeof(row),
+                     "{\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"method\":\"%s\","
+                     "\"first\":%lu,\"last\":%lu,\"count\":%d,"
+                     "\"raven\":%s,\"fw\":\"%s\"",
+                     fyDet[i].mac, fyDet[i].name, fyDet[i].rssi, fyDet[i].method,
+                     fyDet[i].firstSeen, fyDet[i].lastSeen, fyDet[i].count,
+                     fyDet[i].isRaven ? "true" : "false", fyDet[i].ravenFW);
+            out += row;
             if (fyDet[i].hasGPS) {
-                resp->printf(",\"gps\":{\"lat\":%.8f,\"lon\":%.8f,\"acc\":%.1f}",
-                    fyDet[i].gpsLat, fyDet[i].gpsLon, fyDet[i].gpsAcc);
+                char gps[128];
+                snprintf(gps, sizeof(gps), ",\"gps\":{\"lat\":%.8f,\"lon\":%.8f,\"acc\":%.1f}",
+                         fyDet[i].gpsLat, fyDet[i].gpsLon, fyDet[i].gpsAcc);
+                out += gps;
             }
-            resp->print("}");
+            out += "}";
         }
         xSemaphoreGive(fyMutex);
     }
-    resp->print("]");
+    out += "]";
+    return out;
+}
+
+static String fyBuildDetectionsCSV() {
+    String out = "mac,name,rssi,method,first_seen_ms,last_seen_ms,count,is_raven,raven_fw,latitude,longitude,gps_accuracy\n";
+    if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        for (int i = 0; i < fyDetCount; i++) {
+            FYDetection& d = fyDet[i];
+            char row[384];
+            if (d.hasGPS) {
+                snprintf(row, sizeof(row),
+                         "\"%s\",\"%s\",%d,\"%s\",%lu,%lu,%d,%s,\"%s\",%.8f,%.8f,%.1f\n",
+                         d.mac, d.name, d.rssi, d.method, d.firstSeen, d.lastSeen, d.count,
+                         d.isRaven ? "true" : "false", d.ravenFW, d.gpsLat, d.gpsLon, d.gpsAcc);
+            } else {
+                snprintf(row, sizeof(row),
+                         "\"%s\",\"%s\",%d,\"%s\",%lu,%lu,%d,%s,\"%s\",,,\n",
+                         d.mac, d.name, d.rssi, d.method, d.firstSeen, d.lastSeen, d.count,
+                         d.isRaven ? "true" : "false", d.ravenFW);
+            }
+            out += row;
+        }
+        xSemaphoreGive(fyMutex);
+    }
+    return out;
+}
+
+static String fyBuildPatternsJSON() {
+    String out = "{\"macs\":[";
+    for (size_t i = 0; i < flock_mac_prefixes_count; i++) {
+        if (i > 0) out += ",";
+        out += "\"";
+        out += flock_mac_prefixes[i];
+        out += "\"";
+    }
+    out += "],\"macs_mfr\":[";
+    for (size_t i = 0; i < flock_mfr_mac_prefixes_count; i++) {
+        if (i > 0) out += ",";
+        out += "\"";
+        out += flock_mfr_mac_prefixes[i];
+        out += "\"";
+    }
+    out += "],\"macs_soundthinking\":[";
+    for (size_t i = 0; i < soundthinking_mac_prefixes_count; i++) {
+        if (i > 0) out += ",";
+        out += "\"";
+        out += soundthinking_mac_prefixes[i];
+        out += "\"";
+    }
+    out += "],\"names\":[";
+    for (size_t i = 0; i < device_name_patterns_count; i++) {
+        if (i > 0) out += ",";
+        out += "\"";
+        out += device_name_patterns[i];
+        out += "\"";
+    }
+    out += "],\"mfr\":[";
+    for (size_t i = 0; i < ble_manufacturer_ids_count; i++) {
+        if (i > 0) out += ",";
+        out += String(ble_manufacturer_ids[i]);
+    }
+    out += "],\"raven\":[";
+    for (size_t i = 0; i < raven_service_uuids_count; i++) {
+        if (i > 0) out += ",";
+        out += "\"";
+        out += raven_service_uuids[i];
+        out += "\"";
+    }
+    out += "]}";
+    return out;
 }
 
 // ============================================================================
@@ -539,41 +686,100 @@ static void fyPromotePrevSession() {
 // KML EXPORT
 // ============================================================================
 
-static void writeDetectionsKML(AsyncResponseStream *resp) {
-    resp->print("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document>\n"
-                "<name>Flock-You Detections</name>\n"
-                "<description>Surveillance device detections with GPS</description>\n");
-
-    // Detection pin style
-    resp->print("<Style id=\"det\"><IconStyle><color>ff4489ec</color>"
-                "<scale>1.0</scale></IconStyle></Style>\n"
-                "<Style id=\"raven\"><IconStyle><color>ff4444ef</color>"
-                "<scale>1.2</scale></IconStyle></Style>\n");
+static String fyBuildDetectionsKML() {
+    String out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                 "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document>\n"
+                 "<name>Flock-You Detections</name>\n"
+                 "<description>Surveillance device detections with GPS</description>\n"
+                 "<Style id=\"det\"><IconStyle><color>ff4489ec</color>"
+                 "<scale>1.0</scale></IconStyle></Style>\n"
+                 "<Style id=\"raven\"><IconStyle><color>ff4444ef</color>"
+                 "<scale>1.2</scale></IconStyle></Style>\n";
 
     if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(300)) == pdTRUE) {
         for (int i = 0; i < fyDetCount; i++) {
             FYDetection& d = fyDet[i];
-            if (!d.hasGPS) continue;  // Skip detections without GPS
-            resp->print("<Placemark>\n");
-            resp->printf("<name>%s</name>\n", d.mac);
-            resp->printf("<styleUrl>#%s</styleUrl>\n", d.isRaven ? "raven" : "det");
-            resp->print("<description><![CDATA[");
-            if (d.name[0]) resp->printf("<b>Name:</b> %s<br/>", d.name);
-            resp->printf("<b>Method:</b> %s<br/>"
-                         "<b>RSSI:</b> %d dBm<br/>"
-                         "<b>Count:</b> %d<br/>",
-                         d.method, d.rssi, d.count);
-            if (d.isRaven) resp->printf("<b>Raven FW:</b> %s<br/>", d.ravenFW);
-            resp->printf("<b>Accuracy:</b> %.1f m", d.gpsAcc);
-            resp->print("]]></description>\n");
-            resp->printf("<Point><coordinates>%.8f,%.8f,0</coordinates></Point>\n",
-                         d.gpsLon, d.gpsLat);
-            resp->print("</Placemark>\n");
+            if (!d.hasGPS) continue;
+            char row[512];
+            snprintf(row, sizeof(row),
+                     "<Placemark>\n<name>%s</name>\n<styleUrl>#%s</styleUrl>\n<description><![CDATA[",
+                     d.mac, d.isRaven ? "raven" : "det");
+            out += row;
+            if (d.name[0]) {
+                out += "<b>Name:</b> ";
+                out += d.name;
+                out += "<br/>";
+            }
+            snprintf(row, sizeof(row),
+                     "<b>Method:</b> %s<br/><b>RSSI:</b> %d dBm<br/><b>Count:</b> %d<br/>",
+                     d.method, d.rssi, d.count);
+            out += row;
+            if (d.isRaven) {
+                out += "<b>Raven FW:</b> ";
+                out += d.ravenFW;
+                out += "<br/>";
+            }
+            snprintf(row, sizeof(row),
+                     "<b>Accuracy:</b> %.1f m]]></description>\n"
+                     "<Point><coordinates>%.8f,%.8f,0</coordinates></Point>\n"
+                     "</Placemark>\n",
+                     d.gpsAcc, d.gpsLon, d.gpsLat);
+            out += row;
         }
         xSemaphoreGive(fyMutex);
     }
-    resp->print("</Document>\n</kml>");
+    out += "</Document>\n</kml>";
+    return out;
+}
+
+static String fyBuildPrevSessionKML(const String& content, int* placedOut = nullptr) {
+    if (placedOut) *placedOut = 0;
+    String out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                 "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document>\n"
+                 "<name>Flock-You Prior Session</name>\n"
+                 "<description>Surveillance device detections from prior session</description>\n"
+                 "<Style id=\"det\"><IconStyle><color>ff4489ec</color>"
+                 "<scale>1.0</scale></IconStyle></Style>\n"
+                 "<Style id=\"raven\"><IconStyle><color>ff4444ef</color>"
+                 "<scale>1.2</scale></IconStyle></Style>\n";
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, content);
+    if (!err && doc.is<JsonArray>()) {
+        int placed = 0;
+        for (JsonObject d : doc.as<JsonArray>()) {
+            JsonObject gps = d["gps"];
+            if (!gps || !gps.containsKey("lat")) continue;
+            bool isRaven = d["raven"] | false;
+            char row[768];
+            snprintf(row, sizeof(row),
+                     "<Placemark><name>%s</name>\n<styleUrl>#%s</styleUrl>\n<description><![CDATA[",
+                     d["mac"] | "?", isRaven ? "raven" : "det");
+            out += row;
+            if (d["name"].is<const char*>() && strlen(d["name"] | "") > 0) {
+                out += "<b>Name:</b> ";
+                out += (const char*)(d["name"] | "");
+                out += "<br/>";
+            }
+            snprintf(row, sizeof(row),
+                     "<b>Method:</b> %s<br/><b>RSSI:</b> %d<br/><b>Count:</b> %d",
+                     d["method"] | "?", d["rssi"] | 0, d["count"] | 1);
+            out += row;
+            if (isRaven && d["fw"].is<const char*>()) {
+                out += "<br/><b>Raven FW:</b> ";
+                out += (const char*)(d["fw"] | "");
+            }
+            snprintf(row, sizeof(row),
+                     "]]></description>\n<Point><coordinates>%.8f,%.8f,0</coordinates></Point>\n</Placemark>\n",
+                     (double)(gps["lon"] | 0.0), (double)(gps["lat"] | 0.0));
+            out += row;
+            placed++;
+        }
+        if (placedOut) *placedOut = placed;
+    }
+
+    out += "</Document>\n</kml>";
+    return out;
 }
 
 // ============================================================================
@@ -660,7 +866,7 @@ function stats(){document.getElementById('sT').textContent=D.length;document.get
 fetch('/api/stats').then(r=>r.json()).then(s=>{let g=document.getElementById('sG');if(s.gps_valid){g.textContent=s.gps_tagged+'/'+s.total;g.style.color='#22c55e';}else{g.textContent='OFF';g.style.color='#ef4444';}}).catch(()=>{});}
 function card(d){return '<div class="det"><div class="mac">'+d.mac+(d.name?'<span class="nm">'+d.name+'</span>':'')+'</div><div class="inf"><span>RSSI: '+d.rssi+'</span><span>'+d.method+'</span><span style="color:#ec4899;font-weight:bold">&times;'+d.count+'</span>'+(d.raven?'<span class="rv">RAVEN '+d.fw+'</span>':'')+(d.gps?'<span style="color:#22c55e">&#9673; '+d.gps.lat.toFixed(5)+','+d.gps.lon.toFixed(5)+'</span>':'<span style="color:#666">no gps</span>')+'</div></div>';}
 function loadHistory(){fetch('/api/history').then(r=>r.json()).then(d=>{H=d;let el=document.getElementById('hL');if(!H.length){el.innerHTML='<div class="empty">No prior session data</div>';return;}
-H.sort((a,b)=>b.last-a.last);el.innerHTML='<div style="font-size:11px;color:#8b5cf6;margin-bottom:8px">'+H.length+' detections from prior session</div>'+H.map(card).join('');window._hL=1;}).catch(()=>{document.getElementById('hL').innerHTML='<div class="empty">No prior session data</div>';});}
+H.sort((a,b)=>b.last-a.last);el.innerHTML='<div style="font-size:11px;color:#8b5cf6;margin-bottom:8px">'+H.length+' detections from prior session</div>'+H.map(card).join('');window._hL=1;}).catch(()=>{document.getElementById('hL').innerHTML='<div class="empty">History load failed</div>';});}
 function loadPat(){fetch('/api/patterns').then(r=>r.json()).then(p=>{let h='';
 h+='<div class="pg"><h3>Flock MAC Prefixes ('+p.macs.length+')</h3><div class="it">'+p.macs.map(m=>'<span>'+m+'</span>').join('')+'</div></div>';
 h+='<div class="pg"><h3>Contract Mfr MACs ('+p.macs_mfr.length+')</h3><div class="it">'+p.macs_mfr.map(m=>'<span>'+m+'</span>').join('')+'</div></div>';
@@ -668,17 +874,15 @@ h+='<div class="pg"><h3>SoundThinking MACs ('+p.macs_soundthinking.length+')</h3
 h+='<div class="pg"><h3>BLE Device Names ('+p.names.length+')</h3><div class="it">'+p.names.map(n=>'<span>'+n+'</span>').join('')+'</div></div>';
 h+='<div class="pg"><h3>BLE Manufacturer IDs ('+p.mfr.length+')</h3><div class="it">'+p.mfr.map(m=>'<span>0x'+m.toString(16).toUpperCase().padStart(4,'0')+'</span>').join('')+'</div></div>';
 h+='<div class="pg"><h3>Raven UUIDs ('+p.raven.length+')</h3><div class="it">'+p.raven.map(u=>'<span style="font-size:8px">'+u+'</span>').join('')+'</div></div>';
-document.getElementById('pC').innerHTML=h;window._pL=1;}).catch(()=>{});}
+document.getElementById('pC').innerHTML=h;window._pL=1;}).catch(()=>{document.getElementById('pC').innerHTML='<div class="empty">Pattern DB load failed</div>';});}
 // GPS from phone -> ESP32 (wardriving)
-// NOTE: Geolocation API needs secure context (HTTPS) on most browsers.
-// HTTP works on: Android Chrome (local IPs), some Android browsers.
-// Won't work on: iOS Safari (needs HTTPS always).
+// Geolocation requires secure context; this dashboard is served over HTTPS.
 // We only request on user tap (gesture) for best permission prompt chance.
 let _gW=null,_gOk=false,_gTried=false;
 function sendGPS(p){_gOk=true;let g=document.getElementById('sG');g.textContent='OK';g.style.color='#22c55e';
 fetch('/api/gps?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&acc='+(p.coords.accuracy||0)).catch(()=>{});}
 function gpsErr(e){_gOk=false;let g=document.getElementById('sG');
-var msg='ERR';if(e.code===1){msg='DENIED';g.style.color='#ef4444';alert('GPS permission denied. On iPhone, GPS requires HTTPS which this device cannot provide. On Android Chrome, tap the lock/info icon in the address bar and allow Location.');}
+var msg='ERR';if(e.code===1){msg='DENIED';g.style.color='#ef4444';alert('GPS permission denied. Check browser Location permissions and certificate trust for this HTTPS page.');}
 else if(e.code===2){msg='N/A';g.style.color='#ef4444';}
 else if(e.code===3){msg='WAIT';g.style.color='#facc15';}
 g.textContent=msg;}
@@ -688,7 +892,7 @@ let g=document.getElementById('sG');g.textContent='...';g.style.color='#facc15';
 _gW=navigator.geolocation.watchPosition(sendGPS,gpsErr,{enableHighAccuracy:true,maximumAge:5000,timeout:15000});return true;}
 function reqGPS(){if(!navigator.geolocation){alert('GPS not available in this browser.');return;}
 if(_gOk){return;}
-if(!window.isSecureContext){alert('GPS requires a secure context (HTTPS). This HTTP page may not get GPS permission.\\n\\nAndroid Chrome: try chrome://flags and enable "Insecure origins treated as secure", add http://192.168.4.1\\n\\niPhone: GPS will not work over HTTP.');}
+if(!window.isSecureContext){alert('GPS requires a secure context (HTTPS). Re-open the dashboard over https://192.168.4.1 or https://flockyou.local.');}
 startGPS();_gTried=true;}
 refresh();setInterval(refresh,2500);
 </script></body></html>
@@ -698,225 +902,190 @@ refresh();setInterval(refresh,2500);
 // WEB SERVER SETUP
 // ============================================================================
 
-static void fySetupServer() {
-    // Dashboard
-    fyServer.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
-        r->send(200, "text/html", FY_HTML);
-    });
+static esp_err_t fySendResponse(httpd_req_t* req, const char* status, const char* contentType, const String& body) {
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, contentType);
+    return httpd_resp_send(req, body.c_str(), body.length());
+}
 
-    // API: Detection list
-    fyServer.on("/api/detections", HTTP_GET, [](AsyncWebServerRequest *r) {
-        AsyncResponseStream *resp = r->beginResponseStream("application/json");
-        writeDetectionsJSON(resp);
-        r->send(resp);
-    });
+static bool fyGetQueryParam(httpd_req_t* req, const char* key, char* out, size_t outLen) {
+    int qLen = httpd_req_get_url_query_len(req) + 1;
+    if (qLen <= 1 || (size_t)qLen > 256) return false;
+    char query[256];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
+    return httpd_query_key_value(query, key, out, outLen) == ESP_OK;
+}
 
-    // API: Stats (includes GPS status)
-    fyServer.on("/api/stats", HTTP_GET, [](AsyncWebServerRequest *r) {
-        int raven = 0, withGPS = 0;
-        if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            for (int i = 0; i < fyDetCount; i++) {
-                if (fyDet[i].isRaven) raven++;
-                if (fyDet[i].hasGPS) withGPS++;
-            }
-            xSemaphoreGive(fyMutex);
-        }
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-            "{\"total\":%d,\"raven\":%d,\"ble\":\"active\","
-            "\"gps_valid\":%s,\"gps_age\":%lu,\"gps_tagged\":%d}",
-            fyDetCount, raven,
-            fyGPSIsFresh() ? "true" : "false",
-            fyGPSValid ? (millis() - fyGPSLastUpdate) : 0UL,
-            withGPS);
-        r->send(200, "application/json", buf);
-    });
+static esp_err_t fyHandleRoot(httpd_req_t* req) {
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, FY_HTML, HTTPD_RESP_USE_STRLEN);
+}
 
-    // API: Receive GPS from phone browser
-    fyServer.on("/api/gps", HTTP_GET, [](AsyncWebServerRequest *r) {
-        if (r->hasParam("lat") && r->hasParam("lon")) {
-            fyGPSLat = r->getParam("lat")->value().toDouble();
-            fyGPSLon = r->getParam("lon")->value().toDouble();
-            fyGPSAcc = r->hasParam("acc") ? r->getParam("acc")->value().toFloat() : 0;
-            fyGPSValid = true;
-            fyGPSLastUpdate = millis();
-            r->send(200, "application/json", "{\"status\":\"ok\"}");
-        } else {
-            r->send(400, "application/json", "{\"error\":\"lat,lon required\"}");
-        }
-    });
+static esp_err_t fyHandleDetections(httpd_req_t* req) {
+    return fySendResponse(req, "200 OK", "application/json", fyBuildDetectionsJSON());
+}
 
-    // API: Pattern database
-    fyServer.on("/api/patterns", HTTP_GET, [](AsyncWebServerRequest *r) {
-        AsyncResponseStream *resp = r->beginResponseStream("application/json");
-        resp->print("{\"macs\":[");
-        for (size_t i = 0; i < flock_mac_prefixes_count; i++) {
-            if (i > 0) resp->print(",");
-            resp->printf("\"%s\"", flock_mac_prefixes[i]);
+static esp_err_t fyHandleStats(httpd_req_t* req) {
+    int raven = 0;
+    int withGPS = 0;
+    int total = 0;
+    if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        total = fyDetCount;
+        for (int i = 0; i < fyDetCount; i++) {
+            if (fyDet[i].isRaven) raven++;
+            if (fyDet[i].hasGPS) withGPS++;
         }
-        resp->print("],\"macs_mfr\":[");
-        for (size_t i = 0; i < flock_mfr_mac_prefixes_count; i++) {
-            if (i > 0) resp->print(",");
-            resp->printf("\"%s\"", flock_mfr_mac_prefixes[i]);
-        }
-        resp->print("],\"macs_soundthinking\":[");
-        for (size_t i = 0; i < soundthinking_mac_prefixes_count; i++) {
-            if (i > 0) resp->print(",");
-            resp->printf("\"%s\"", soundthinking_mac_prefixes[i]);
-        }
-        resp->print("],\"names\":[");
-        for (size_t i = 0; i < device_name_patterns_count; i++) {
-            if (i > 0) resp->print(",");
-            resp->printf("\"%s\"", device_name_patterns[i]);
-        }
-        resp->print("],\"mfr\":[");
-        for (size_t i = 0; i < ble_manufacturer_ids_count; i++) {
-            if (i > 0) resp->print(",");
-            resp->printf("%u", ble_manufacturer_ids[i]);
-        }
-        resp->print("],\"raven\":[");
-        for (size_t i = 0; i < raven_service_uuids_count; i++) {
-            if (i > 0) resp->print(",");
-            resp->printf("\"%s\"", raven_service_uuids[i]);
-        }
-        resp->print("]}");
-        r->send(resp);
-    });
+        xSemaphoreGive(fyMutex);
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "{\"total\":%d,\"raven\":%d,\"ble\":\"active\","
+             "\"gps_valid\":%s,\"gps_age\":%lu,\"gps_tagged\":%d}",
+             total, raven, fyGPSIsFresh() ? "true" : "false",
+             fyGPSValid ? (millis() - fyGPSLastUpdate) : 0UL, withGPS);
+    return fySendResponse(req, "200 OK", "application/json", String(buf));
+}
 
-    // API: Export JSON (downloadable file)
-    fyServer.on("/api/export/json", HTTP_GET, [](AsyncWebServerRequest *r) {
-        AsyncResponseStream *resp = r->beginResponseStream("application/json");
-        resp->addHeader("Content-Disposition", "attachment; filename=\"flockyou_detections.json\"");
-        writeDetectionsJSON(resp);
-        r->send(resp);
-    });
+static esp_err_t fyHandleGps(httpd_req_t* req) {
+    char lat[32];
+    char lon[32];
+    char acc[32];
+    if (!fyGetQueryParam(req, "lat", lat, sizeof(lat)) || !fyGetQueryParam(req, "lon", lon, sizeof(lon))) {
+        return fySendResponse(req, "400 Bad Request", "application/json", "{\"error\":\"lat,lon required\"}");
+    }
+    fyGPSLat = atof(lat);
+    fyGPSLon = atof(lon);
+    fyGPSAcc = fyGetQueryParam(req, "acc", acc, sizeof(acc)) ? (float)atof(acc) : 0.0f;
+    fyGPSValid = true;
+    fyGPSLastUpdate = millis();
+    return fySendResponse(req, "200 OK", "application/json", "{\"status\":\"ok\"}");
+}
 
-    // API: Export CSV (downloadable file, includes GPS)
-    fyServer.on("/api/export/csv", HTTP_GET, [](AsyncWebServerRequest *r) {
-        AsyncResponseStream *resp = r->beginResponseStream("text/csv");
-        resp->addHeader("Content-Disposition", "attachment; filename=\"flockyou_detections.csv\"");
-        resp->println("mac,name,rssi,method,first_seen_ms,last_seen_ms,count,is_raven,raven_fw,latitude,longitude,gps_accuracy");
-        if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-            for (int i = 0; i < fyDetCount; i++) {
-                FYDetection& d = fyDet[i];
-                if (d.hasGPS) {
-                    resp->printf("\"%s\",\"%s\",%d,\"%s\",%lu,%lu,%d,%s,\"%s\",%.8f,%.8f,%.1f\n",
-                        d.mac, d.name, d.rssi, d.method,
-                        d.firstSeen, d.lastSeen, d.count,
-                        d.isRaven ? "true" : "false", d.ravenFW,
-                        d.gpsLat, d.gpsLon, d.gpsAcc);
-                } else {
-                    resp->printf("\"%s\",\"%s\",%d,\"%s\",%lu,%lu,%d,%s,\"%s\",,,\n",
-                        d.mac, d.name, d.rssi, d.method,
-                        d.firstSeen, d.lastSeen, d.count,
-                        d.isRaven ? "true" : "false", d.ravenFW);
-                }
-            }
-            xSemaphoreGive(fyMutex);
-        }
-        r->send(resp);
-    });
+static esp_err_t fyHandlePatterns(httpd_req_t* req) {
+    return fySendResponse(req, "200 OK", "application/json", fyBuildPatternsJSON());
+}
 
-    // API: Export KML (GPS-tagged detections for Google Earth)
-    fyServer.on("/api/export/kml", HTTP_GET, [](AsyncWebServerRequest *r) {
-        AsyncResponseStream *resp = r->beginResponseStream("application/vnd.google-earth.kml+xml");
-        resp->addHeader("Content-Disposition", "attachment; filename=\"flockyou_detections.kml\"");
-        writeDetectionsKML(resp);
-        r->send(resp);
-    });
+static esp_err_t fyHandleExportJson(httpd_req_t* req) {
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"flockyou_detections.json\"");
+    return fySendResponse(req, "200 OK", "application/json", fyBuildDetectionsJSON());
+}
 
-    // API: Prior session history (JSON)
-    fyServer.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *r) {
-        if (fySpiffsReady && SPIFFS.exists(FY_PREV_FILE)) {
-            r->send(SPIFFS, FY_PREV_FILE, "application/json");
-        } else {
-            r->send(200, "application/json", "[]");
-        }
-    });
+static esp_err_t fyHandleExportCsv(httpd_req_t* req) {
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"flockyou_detections.csv\"");
+    return fySendResponse(req, "200 OK", "text/csv", fyBuildDetectionsCSV());
+}
 
-    // API: Download prior session as JSON file
-    fyServer.on("/api/history/json", HTTP_GET, [](AsyncWebServerRequest *r) {
-        if (fySpiffsReady && SPIFFS.exists(FY_PREV_FILE)) {
-            AsyncWebServerResponse *resp = r->beginResponse(SPIFFS, FY_PREV_FILE, "application/json");
-            resp->addHeader("Content-Disposition", "attachment; filename=\"flockyou_prev_session.json\"");
-            r->send(resp);
-        } else {
-            r->send(404, "application/json", "{\"error\":\"no prior session\"}");
-        }
-    });
+static esp_err_t fyHandleExportKml(httpd_req_t* req) {
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"flockyou_detections.kml\"");
+    return fySendResponse(req, "200 OK", "application/vnd.google-earth.kml+xml", fyBuildDetectionsKML());
+}
 
-    // API: Download prior session as KML (reads JSON from SPIFFS, converts)
-    fyServer.on("/api/history/kml", HTTP_GET, [](AsyncWebServerRequest *r) {
-        if (!fySpiffsReady || !SPIFFS.exists(FY_PREV_FILE)) {
-            r->send(404, "application/json", "{\"error\":\"no prior session\"}");
-            return;
-        }
-        File f = SPIFFS.open(FY_PREV_FILE, "r");
-        if (!f) { r->send(500, "text/plain", "read error"); return; }
-        String content = f.readString();
-        f.close();
-        if (content.length() == 0) {
-            r->send(404, "application/json", "{\"error\":\"prior session empty\"}");
-            return;
-        }
-        AsyncResponseStream *resp = r->beginResponseStream("application/vnd.google-earth.kml+xml");
-        resp->addHeader("Content-Disposition", "attachment; filename=\"flockyou_prev_session.kml\"");
-        resp->print("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                    "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document>\n"
-                    "<name>Flock-You Prior Session</name>\n"
-                    "<description>Surveillance device detections from prior session</description>\n"
-                    "<Style id=\"det\"><IconStyle><color>ff4489ec</color>"
-                    "<scale>1.0</scale></IconStyle></Style>\n"
-                    "<Style id=\"raven\"><IconStyle><color>ff4444ef</color>"
-                    "<scale>1.2</scale></IconStyle></Style>\n");
-        // Parse JSON array and emit placemarks
-        JsonDocument doc;
-        DeserializationError err = deserializeJson(doc, content);
-        if (!err && doc.is<JsonArray>()) {
-            int placed = 0;
-            for (JsonObject d : doc.as<JsonArray>()) {
-                JsonObject gps = d["gps"];
-                if (!gps || !gps.containsKey("lat")) continue;
-                bool isRaven = d["raven"] | false;
-                resp->printf("<Placemark><name>%s</name>\n", d["mac"] | "?");
-                resp->printf("<styleUrl>#%s</styleUrl>\n", isRaven ? "raven" : "det");
-                resp->print("<description><![CDATA[");
-                if (d["name"].is<const char*>() && strlen(d["name"] | "") > 0)
-                    resp->printf("<b>Name:</b> %s<br/>", d["name"] | "");
-                resp->printf("<b>Method:</b> %s<br/><b>RSSI:</b> %d<br/><b>Count:</b> %d",
-                    d["method"] | "?", d["rssi"] | 0, d["count"] | 1);
-                if (isRaven && d["fw"].is<const char*>())
-                    resp->printf("<br/><b>Raven FW:</b> %s", d["fw"] | "");
-                resp->print("]]></description>\n");
-                resp->printf("<Point><coordinates>%.8f,%.8f,0</coordinates></Point>\n",
-                    (double)(gps["lon"] | 0.0), (double)(gps["lat"] | 0.0));
-                resp->print("</Placemark>\n");
-                placed++;
-            }
-            printf("[FLOCK-YOU] Prior session KML: %d placemarks\n", placed);
-        } else {
-            printf("[FLOCK-YOU] Prior session KML: JSON parse failed\n");
-        }
-        resp->print("</Document>\n</kml>");
-        r->send(resp);
-    });
+static esp_err_t fyHandleHistory(httpd_req_t* req) {
+    if (!fySpiffsReady || !SPIFFS.exists(FY_PREV_FILE))
+        return fySendResponse(req, "200 OK", "application/json", "[]");
+    File f = SPIFFS.open(FY_PREV_FILE, "r");
+    if (!f) return fySendResponse(req, "500 Internal Server Error", "text/plain", "read error");
+    String content = f.readString();
+    f.close();
+    return fySendResponse(req, "200 OK", "application/json", content.length() ? content : "[]");
+}
 
-    // API: Clear all detections (saves current session first)
-    fyServer.on("/api/clear", HTTP_GET, [](AsyncWebServerRequest *r) {
-        fySaveSession();  // Persist before clearing
-        if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-            fyDetCount = 0;
-            memset(fyDet, 0, sizeof(fyDet));
-            fyTriggered = false;
-            fyDeviceInRange = false;
-            xSemaphoreGive(fyMutex);
-        }
-        r->send(200, "application/json", "{\"status\":\"cleared\"}");
-        printf("[FLOCK-YOU] All detections cleared (session saved)\n");
-    });
+static esp_err_t fyHandleHistoryJson(httpd_req_t* req) {
+    if (!fySpiffsReady || !SPIFFS.exists(FY_PREV_FILE))
+        return fySendResponse(req, "404 Not Found", "application/json", "{\"error\":\"no prior session\"}");
+    File f = SPIFFS.open(FY_PREV_FILE, "r");
+    if (!f) return fySendResponse(req, "500 Internal Server Error", "text/plain", "read error");
+    String content = f.readString();
+    f.close();
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"flockyou_prev_session.json\"");
+    return fySendResponse(req, "200 OK", "application/json", content.length() ? content : "[]");
+}
 
-    fyServer.begin();
-    printf("[FLOCK-YOU] Web server started on port 80\n");
+static esp_err_t fyHandleHistoryKml(httpd_req_t* req) {
+    if (!fySpiffsReady || !SPIFFS.exists(FY_PREV_FILE))
+        return fySendResponse(req, "404 Not Found", "application/json", "{\"error\":\"no prior session\"}");
+    File f = SPIFFS.open(FY_PREV_FILE, "r");
+    if (!f) return fySendResponse(req, "500 Internal Server Error", "text/plain", "read error");
+    String content = f.readString();
+    f.close();
+    if (content.length() == 0)
+        return fySendResponse(req, "404 Not Found", "application/json", "{\"error\":\"prior session empty\"}");
+    int placed = 0;
+    String kml = fyBuildPrevSessionKML(content, &placed);
+    printf("[FLOCK-YOU] Prior session KML: %d placemarks\n", placed);
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"flockyou_prev_session.kml\"");
+    return fySendResponse(req, "200 OK", "application/vnd.google-earth.kml+xml", kml);
+}
+
+static esp_err_t fyHandleClear(httpd_req_t* req) {
+    fySaveSession();
+    if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        fyDetCount = 0;
+        memset(fyDet, 0, sizeof(fyDet));
+        fyTriggered = false;
+        fyDeviceInRange = false;
+        xSemaphoreGive(fyMutex);
+    }
+    printf("[FLOCK-YOU] All detections cleared (session saved)\n");
+    return fySendResponse(req, "200 OK", "application/json", "{\"status\":\"cleared\"}");
+}
+
+static void fyStartHttpsServer() {
+    if (fyHttpsServer) return;
+    httpd_ssl_config_t cfg = HTTPD_SSL_CONFIG_DEFAULT();
+    // Keep TLS RAM usage low on ESP32-S3 builds with display + BLE active.
+    // SSL sessions are memory-heavy; limiting socket count helps avoid
+    // mbedtls alloc failures during handshake.
+    cfg.httpd.max_uri_handlers = 12;
+    cfg.httpd.max_resp_headers = 4;
+    cfg.httpd.backlog_conn = 2;
+    cfg.httpd.max_open_sockets = 2;
+    cfg.httpd.stack_size = 6144;
+    cfg.transport_mode = HTTPD_SSL_TRANSPORT_SECURE;
+    cfg.port_secure = 443;
+    cfg.cacert_pem = (const uint8_t*)FY_AP_TLS_CERT_PEM;
+    cfg.cacert_len = FY_AP_TLS_CERT_PEM_len;
+    cfg.prvtkey_pem = (const uint8_t*)FY_AP_TLS_KEY_PEM;
+    cfg.prvtkey_len = FY_AP_TLS_KEY_PEM_len;
+    printf("[FLOCK-YOU] HTTPS cfg: sockets=%d handlers=%d stack=%d heap=%u\n",
+           cfg.httpd.max_open_sockets, cfg.httpd.max_uri_handlers,
+           cfg.httpd.stack_size,
+           (unsigned)ESP.getFreeHeap());
+    esp_err_t err = httpd_ssl_start(&fyHttpsServer, &cfg);
+    if (err != ESP_OK) {
+        printf("[FLOCK-YOU] HTTPS server start failed: %s\n", esp_err_to_name(err));
+        fyHttpsServer = NULL;
+        return;
+    }
+
+    static const httpd_uri_t routes[] = {
+        {.uri = "/", .method = HTTP_GET, .handler = fyHandleRoot, .user_ctx = nullptr},
+        {.uri = "/api/detections", .method = HTTP_GET, .handler = fyHandleDetections, .user_ctx = nullptr},
+        {.uri = "/api/stats", .method = HTTP_GET, .handler = fyHandleStats, .user_ctx = nullptr},
+        {.uri = "/api/gps", .method = HTTP_GET, .handler = fyHandleGps, .user_ctx = nullptr},
+        {.uri = "/api/patterns", .method = HTTP_GET, .handler = fyHandlePatterns, .user_ctx = nullptr},
+        {.uri = "/api/export/json", .method = HTTP_GET, .handler = fyHandleExportJson, .user_ctx = nullptr},
+        {.uri = "/api/export/csv", .method = HTTP_GET, .handler = fyHandleExportCsv, .user_ctx = nullptr},
+        {.uri = "/api/export/kml", .method = HTTP_GET, .handler = fyHandleExportKml, .user_ctx = nullptr},
+        {.uri = "/api/history", .method = HTTP_GET, .handler = fyHandleHistory, .user_ctx = nullptr},
+        {.uri = "/api/history/json", .method = HTTP_GET, .handler = fyHandleHistoryJson, .user_ctx = nullptr},
+        {.uri = "/api/history/kml", .method = HTTP_GET, .handler = fyHandleHistoryKml, .user_ctx = nullptr},
+        {.uri = "/api/clear", .method = HTTP_GET, .handler = fyHandleClear, .user_ctx = nullptr},
+    };
+    for (size_t i = 0; i < (sizeof(routes) / sizeof(routes[0])); i++) {
+        esp_err_t regErr = httpd_register_uri_handler(fyHttpsServer, &routes[i]);
+        if (regErr != ESP_OK) {
+            printf("[FLOCK-YOU] URI register failed for %s: %s\n", routes[i].uri, esp_err_to_name(regErr));
+        }
+    }
+    printf("[FLOCK-YOU] HTTPS server started on port 443\n");
+}
+
+static void fyStopHttpsServer() {
+    if (!fyHttpsServer) return;
+    httpd_ssl_stop(fyHttpsServer);
+    fyHttpsServer = NULL;
+    printf("[FLOCK-YOU] HTTPS server stopped\n");
 }
 
 // ============================================================================
@@ -929,6 +1098,13 @@ void setup() {
 
     fyAudioInit();
     fyMutex = xSemaphoreCreateMutex();
+
+    // Reclaim Classic BT heap; this firmware uses BLE (NimBLE) only.
+    esp_err_t btRelease = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    if (btRelease == ESP_OK)
+        printf("[FLOCK-YOU] Released Classic BT memory\n");
+    else
+        printf("[FLOCK-YOU] Classic BT memory release: %s\n", esp_err_to_name(btRelease));
 
     // Init SPIFFS for session persistence
     if (SPIFFS.begin(true)) {
@@ -953,44 +1129,20 @@ void setup() {
     }
     printf("[FLOCK-YOU] AP: %s / %s\n", FY_AP_SSID, FY_AP_PASS);
     printf("[FLOCK-YOU] IP: %s\n", WiFi.softAPIP().toString().c_str());
-    fySetupServer();
+    fyStartHttpsServer();
 #if defined(BOARD_HAS_PSRAM)
     printf("[FLOCK-YOU] Heap internal=%u psram=%u\n",
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
 #endif
 
-    // Init BLE with device name and large MTU for GATT notifications
-    NimBLEDevice::init("flockyou");
-    NimBLEDevice::setMTU(512);
-
-    // BLE scanner setup
-    fyBLEScan = NimBLEDevice::getScan();
-    fyBLEScan->setAdvertisedDeviceCallbacks(new FYBLECallbacks());
-    fyBLEScan->setActiveScan(true);
-    fyBLEScan->setInterval(100);
-    fyBLEScan->setWindow(99);
-
+    fyInitBleStack();
     // Kick off the first scan right away
-    fyBLEScan->start(fyBleScanDuration, false);
-    fyLastBleScan = millis();
-    printf("[FLOCK-YOU] BLE scanning ACTIVE\n");
-
-    // BLE GATT server — DeFlock app connectivity
-    fyBLEServer = NimBLEDevice::createServer();
-    fyBLEServer->setCallbacks(new FYServerCallbacks());
-    NimBLEService* pService = fyBLEServer->createService(FY_SERVICE_UUID);
-    fyTxChar = pService->createCharacteristic(
-        FY_TX_CHAR_UUID,
-        NIMBLE_PROPERTY::NOTIFY
-    );
-    pService->start();
-
-    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-    pAdv->addServiceUUID(FY_SERVICE_UUID);
-    pAdv->setName("flockyou");
-    pAdv->setScanResponse(true);
-    pAdv->start();
-    printf("[FLOCK-YOU] BLE GATT server advertising (service %s)\n", FY_SERVICE_UUID);
+    if (fyBLEScan) {
+        fyBLEScan->start(fyBleScanDuration, false);
+        fyLastBleScan = millis();
+        printf("[FLOCK-YOU] BLE scanning ACTIVE\n");
+        printf("[FLOCK-YOU] BLE GATT server advertising (service %s)\n", FY_SERVICE_UUID);
+    }
 
     fyBootBeep();
 
@@ -1002,7 +1154,8 @@ void setup() {
 #endif
 
     printf("[FLOCK-YOU] Detection methods: MAC prefix, device name, manufacturer ID, Raven UUID\n");
-    printf("[FLOCK-YOU] Dashboard: http://192.168.4.1\n");
+    printf("[FLOCK-YOU] Build tag: https-ble-deinit-v2\n");
+    printf("[FLOCK-YOU] Dashboard: https://192.168.4.1 (or https://flockyou.local)\n");
     printf("[FLOCK-YOU] Ready - BLE GATT + AP mode\n\n");
 }
 
@@ -1027,13 +1180,21 @@ void loop() {
         fyOnCompanionChange();
     }
 
+    // Pause BLE scans while phone is connected to AP to free heap for TLS.
+    fyUpdateBleForApClients();
+
     // BLE scanning cycle
-    if (millis() - fyLastBleScan >= fyBleScanInterval && !fyBLEScan->isScanning()) {
+    if (fyBLEScan &&
+        !fyBlePausedForApClient &&
+        millis() - fyLastBleScan >= fyBleScanInterval &&
+        !fyBLEScan->isScanning()) {
         fyBLEScan->start(fyBleScanDuration, false);
         fyLastBleScan = millis();
     }
 
-    if (!fyBLEScan->isScanning() && millis() - fyLastBleScan > (unsigned long)fyBleScanDuration * 1000) {
+    if (fyBLEScan &&
+        !fyBLEScan->isScanning() &&
+        millis() - fyLastBleScan > (unsigned long)fyBleScanDuration * 1000) {
         fyBLEScan->clearResults();
     }
 

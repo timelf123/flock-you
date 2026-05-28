@@ -33,7 +33,7 @@ All detection is BLE-based:
 ## Features
 
 - **WiFi AP**: `flockyou` / password `flockyou123`
-- **Web dashboard** at `192.168.4.1` — live detection feed, pattern database, export tools
+- **HTTPS web dashboard** at `https://192.168.4.1` (also `https://flockyou.local`) — live detection feed, pattern database, export tools
 - **GPS wardriving** — phone GPS via browser Geolocation API tags every detection with coordinates
 - **Session persistence** — detections auto-save to flash (SPIFFS) every 60 seconds
 - **Prior session tab** — previous session survives reboot and is viewable in the PREV tab
@@ -46,19 +46,16 @@ All detection is BLE-based:
 
 ---
 
-## Enabling GPS (Android Chrome)
+## Enabling GPS (iPhone + Android)
 
-The dashboard uses your phone's GPS to geotag detections. Because it's served over HTTP, Chrome requires a one-time flag change:
+The dashboard is served over HTTPS so modern mobile browsers can grant Geolocation permission:
 
-1. Open a new Chrome tab and go to `chrome://flags`
-2. Search for **"Insecure origins treated as secure"**
-3. Add `http://192.168.4.1` to the text field
-4. Set the flag to **Enabled**
-5. Tap **Relaunch**
+1. Connect your phone to the `flockyou` AP.
+2. Open `https://192.168.4.1` (or `https://flockyou.local`).
+3. Accept the self-signed certificate warning.
+4. Tap the **GPS** card in the stats bar, then allow Location access.
 
-After relaunching, connect to the `flockyou` AP, open `192.168.4.1`, and tap the **GPS** card in the stats bar to grant location permission.
-
-> **Note:** iOS Safari does not support Geolocation over HTTP. GPS wardriving requires Android with Chrome.
+> **Note:** If location still fails on iPhone, clear Safari website settings for this host and retry after reloading the HTTPS page.
 
 ---
 
@@ -116,7 +113,7 @@ If touches are offset, adjust `FY_TOUCH_SWAP_XY` / `FY_TOUCH_MIRROR_X` / `FY_TOU
 **Dependencies** (managed by PlatformIO):
 
 - `NimBLE-Arduino` — BLE scanning
-- `ESP Async WebServer` + `AsyncTCP` — web dashboard
+- `esp_https_server` (ESP-IDF component) — HTTPS dashboard + API
 - `ArduinoJson` — JSON serialization
 - `SPIFFS` — session persistence to flash
 - `LVGL` + `TFT_eSPI` — on-device UI (screened env only)
